@@ -27,6 +27,21 @@ Format placeholders:
 Color thresholds:
     xxx: print a color based on the value of `xxx` placeholder
 
+IMAP Subscriptions:
+    You can specify a list of filters to decide which folders to match.
+    By default, we match only to INBOX folder (ie: `'filter': ['INBOX']`).
+
+    `'pattern'` will match a folder `pattern`.
+    `'[Pp]attern'` will match `pattern` and `Pattern` folders.
+    `'.*'` will match all folders.
+    `'^pattern'` will match folders beginning with `pattern`.
+    `'pattern$'` will match folders ending with `pattern`.
+    `'^((?![Ss][Pp][Aa][Mm]).)*$'` will match all folders except
+        for every possible case of `spam` folders.
+
+    For more documentation, see https://docs.python.org/3/library/re.html
+    and/or any regex builder on the web. Don't forget to escape characters.
+
 Examples:
 ```
 # add multiple accounts
@@ -63,7 +78,9 @@ mail {                                       #
                 'user': 'lasers',            #      │    │
                 'password': 'kiss_my_butt!', #      │    │
                 'server': 'imap.gmail.com',  #      │    │ 
-                'port': 993,                 #      │    │
+                                             #  <---│----│ no filters to
+                'port': 993,                 #      │    │ match folders, use
+                                             #      │    │ filters ['INBOX']
             },                               #      │    │
             {                                #      │    └── {imap_2}
                 'name': 'work',              # <----│---------└── {work}
@@ -72,6 +89,9 @@ mail {                                       #
                 'server': 'imap.yahoo.com',  #
                                              # <---- no port, use port 993
                 'urgent': False,             # <---- disable urgent
+                                             #       for this account
+                'filters': ['INBOX']         # <---- specify a list of filters
+                                             #       to match folders
             }                                #
         ]
     }
@@ -135,12 +155,14 @@ no_mail
 """
 
 import mailbox
+from csv import reader
 from imaplib import IMAP4_SSL
 from os.path import exists, expanduser, expandvars
 
 STRING_MISSING = 'missing {} {}'
 STRING_INVALID_NAME = 'invalid name `{}`'
 STRING_INVALID_BOX = 'invalid mailbox `{}`'
+STRING_INVALID_FILTER = 'invalid imap filters `{}`'
 
 
 class Py3status:
@@ -156,6 +178,7 @@ class Py3status:
         if not self.accounts:
             raise Exception('missing accounts')
 
+        self.first_run = True
         self.mailboxes = {}
         mailboxes = ['Maildir', 'mbox', 'mh', 'Babyl', 'MMDF', 'IMAP']
         lowercased_names = [x.lower() for x in mailboxes]
@@ -177,6 +200,15 @@ class Py3status:
                         if v not in account:
                             raise Exception(STRING_MISSING.format(mail, v))
                     account.setdefault('port', 993)
+                    if 'filters' in account:
+                        filters = account['filters']
+                        if not isinstance(filters, list):
+                            raise Exception(
+                                STRING_INVALID_FILTER.format(filters)
+                            )
+                    else:
+                        account['filters'] = ['INBOX']
+                    account['folders'] = []
                     self.mailboxes[mail].append(account)
                 else:
                     for box in mailboxes[:-1]:
@@ -206,9 +238,36 @@ class Py3status:
                 if k == 'imap':
                     inbox = IMAP4_SSL(account['server'], account['port'])
                     inbox.login(account['user'], account['password'])
-                    inbox.select(readonly=True)
-                    imap_data = inbox.search(None, '(UNSEEN)')
-                    count_mail = len(imap_data[1][0].split())
+
+                    if self.first_run:
+                        import re
+                        filters = account.pop('filters')
+                        folders = [x[-1] for x in reader(
+                            map(bytes.decode, inbox.list()[1]), delimiter=" "
+                        )]
+                        self.py3.log('=== IMAP {} ==='.format(i))
+                        for name in folders:
+                            subscribed = ' '
+                            for _filter in filters:
+                                if re.match(_filter, name):
+                                    subscribed = 'x'
+                                    folder = name.replace('\\', '\\\\')
+                                    folder = folder.replace('"', '\\"')
+                                    folder = '"{}"'.format(folder)
+                                    if folder not in account['folders']:
+                                        account['folders'].append(folder)
+                            self.py3.log('[{}] {}'.format(subscribed, name))
+                        if not account['folders']:
+                            self.py3.error(
+                                STRING_INVALID_FILTER.format(filters)
+                            )
+
+                    count_mail = 0
+                    for folder in account['folders']:
+                        if inbox.select(folder, readonly=True)[0] == 'OK':
+                            imap_data = inbox.search(None, '(UNSEEN)')
+                            count_mail += len(imap_data[1][0].split())
+
                     inbox.close()
                     inbox.logout()
                 else:
@@ -227,6 +286,8 @@ class Py3status:
         for x in self.thresholds_init:
             if x in mail_data:
                 self.py3.threshold_get_color(mail_data[x], x)
+
+        self.first_run = False
 
         response = {
             'cached_until': self.py3.time_in(self.cache_timeout),
